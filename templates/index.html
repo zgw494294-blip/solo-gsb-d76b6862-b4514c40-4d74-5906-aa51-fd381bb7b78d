@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Python 逐行执行观察器</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+  <header>
+    <h1>Python 逐行执行观察器</h1>
+    <span id="status" class="badge badge-idle">空闲</span>
+  </header>
+  <main>
+    <section class="editor-pane">
+      <div class="toolbar">
+        <label>示例：
+          <select id="examples">
+            <option value="">选择示例…</option>
+            <option value="assign">赋值</option>
+            <option value="func">函数调用</option>
+            <option value="loop">循环</option>
+            <option value="exc">异常</option>
+          </select>
+        </label>
+        <span id="line-count">0 / {{ max_lines }} 行</span>
+      </div>
+      <textarea id="code" spellcheck="false"
+        placeholder="在此输入最多 {{ max_lines }} 行 Python 代码（不支持 input() 与第三方包）"></textarea>
+      <div class="toolbar">
+        <button id="btn-run" class="primary">▶ 运行</button>
+        <button id="btn-step" disabled>单步</button>
+        <button id="btn-continue" disabled>继续</button>
+        <button id="btn-terminate" class="danger" disabled>终止</button>
+        <span id="message" class="message"></span>
+      </div>
+    </section>
+    <section class="view-pane">
+      <h2>执行视图 <span class="hint">（高亮行为下一条待执行行）</span></h2>
+      <pre id="listing" class="listing empty">（尚未运行）</pre>
+      <h2>局部变量</h2>
+      <table id="locals"><tbody><tr class="empty"><td>（无）</td></tr></tbody></table>
+      <h2>标准输出</h2>
+      <pre id="stdout" class="output"></pre>
+      <h2>异常</h2>
+      <pre id="exception" class="exception"></pre>
+    </section>
+  </main>
+  <script>const MAX_LINES = {{ max_lines }};</script>
+  <script src="{{ url_for('static', filename='app.js') }}"></script>
+</body>
+</html>
