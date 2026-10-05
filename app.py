@@ -13,6 +13,31 @@ exposes a small JSON API:
 Only one unfinished run is allowed at a time. Step/continue are accepted
 at most once per pause; duplicate or stale requests are rejected with 409
 and do not advance execution.
+
+Lifecycle coordination (startup-time termination race)
+-----------------------------------------------------
+A run is registered (CURRENT) before its child process exists, and the
+actual subprocess.Popen call cannot be performed under the global lock
+(it would deadlock against a terminate that must wait for that very
+spawn). Instead two primitives coordinate the window:
+
+  LOCK        guards every visible run attribute (status, proc, events).
+  STARTUP_COND a separate condition used only to wait for "the child has
+              been fully spawned (or definitively failed to)".
+
+If /api/terminate arrives while the child does not exist yet, it marks
+the run terminated (terminate_requested) and waits on STARTUP_COND. When
+Popen finishes, /api/run either hands the just-created child over to that
+terminate (which kills and reaps it) or, if no terminate is pending,
+publishes the run normally. In both cases /api/terminate returns success
+only after the child is dead and reaped; an unfinished startup can never
+leave a live or unreaped orphan behind.
+
+  * /api/run refuses while CURRENT is not fully reaped (a child still
+    alive or not yet wait()ed), so an immediate rerun cannot start while
+    the previous child is outstanding.
+  * Late events arriving after termination are discarded and cannot flip
+    the run back to paused/finished.
 """
 
 import json
@@ -30,10 +55,16 @@ MAX_LINES = 80
 MAX_CODE_BYTES = 20_000
 MAX_STDOUT_CHARS = 100_000
 
-LOCK = threading.Lock()
+# Guards all visible run state (status/proc/events/reaped).
+LOCK = threading.RLock()
+# Separate condition for the spawn window: terminate waits here for a
+# not-yet-attached child without blocking the spawning thread.
+STARTUP_COND = threading.Condition()
 CURRENT = None  # the single current run (active or most recently finished)
 
-ACTIVE_STATES = ("running", "paused")
+# Internal statuses. "starting" only exists while the child is being
+# spawned and is reported as "running" in snapshots.
+ACTIVE_STATES = ("starting", "running", "paused")
 
 TRACER_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tracer.py")
 
@@ -42,7 +73,7 @@ class Run:
     def __init__(self, code):
         self.run_id = uuid.uuid4().hex
         self.lines = code.splitlines()
-        self.status = "running"  # running | paused | finished | exception | terminated
+        self.status = "starting"  # starting | running | paused | finished | exception | terminated
         self.pause_seq = 0       # incremented on every pause event
         self.pause_consumed = False  # one accepted step/continue per pause
         self.current_line = None
@@ -51,11 +82,17 @@ class Run:
         self.stdout_truncated = False
         self.exception = None
         self.proc = None
+        self.reaped = False      # child has exited AND been wait()ed
+        # spawn bookkeeping (guarded by STARTUP_COND's lock)
+        self.spawn_done = False       # Popen finished (success or failure)
+        self.terminate_requested = False  # terminate arrived during spawn
 
     def snapshot(self):
+        # "starting" is an internal spawn-lock detail; clients see running.
+        status = "running" if self.status == "starting" else self.status
         return {
             "run_id": self.run_id,
-            "status": self.status,
+            "status": status,
             "pause_seq": self.pause_seq,
             "current_line": self.current_line,
             "locals": self.locals,
@@ -67,7 +104,13 @@ class Run:
 
 
 def reader_thread(run):
-    """Consumes events from the tracer subprocess and reaps it at EOF."""
+    """Consumes events from the tracer subprocess and reaps it at EOF.
+
+    Events are only applied while the run is still active: anything that
+    arrives after termination (a late pause/stdout/end) is discarded so it
+    can never resurrect the run's status. This thread is the single place
+    that waits on the child; /api/terminate blocks on run.reaped.
+    """
     proc = run.proc
     try:
         for raw in proc.stdout:
@@ -76,6 +119,10 @@ def reader_thread(run):
             except ValueError:
                 continue
             with LOCK:
+                # Gate every event on liveness: terminated (or otherwise
+                # finished) runs never accept late events.
+                if run.status not in ACTIVE_STATES:
+                    continue
                 kind = event.get("type")
                 if kind == "pause":
                     run.pause_seq += 1
@@ -95,10 +142,37 @@ def reader_thread(run):
                     if run.status in ACTIVE_STATES:
                         run.status = "finished"
     finally:
-        proc.wait()  # reap the child process
+        # Reap the child (no LOCK held while waiting). reaped is published
+        # exactly once, after the zombie is gone.
+        try:
+            proc.wait()
+        except OSError:
+            pass
         with LOCK:
             if run.status in ACTIVE_STATES:
                 run.status = "finished"
+            run.reaped = True
+        with STARTUP_COND:
+            STARTUP_COND.notify_all()
+
+
+def _kill_and_wait_for_reap(run, proc, timeout=5):
+    """Kill proc and block until the reader has reaped it."""
+    try:
+        proc.kill()
+    except OSError:
+        pass
+    with STARTUP_COND:
+        STARTUP_COND.wait_for(lambda: run.reaped, timeout=timeout)
+    if not run.reaped:
+        # Defensive fallback if the reader is delayed: wait() is safe to
+        # call concurrently with the reader.
+        try:
+            proc.wait(timeout=timeout)
+        except (subprocess.TimeoutExpired, OSError):
+            pass
+        with STARTUP_COND:
+            STARTUP_COND.wait_for(lambda: run.reaped, timeout=2)
 
 
 @app.get("/")
@@ -120,28 +194,84 @@ def api_run():
         return jsonify({"error": f"代码最多 {MAX_LINES} 行（当前 {line_count} 行）"}), 400
 
     with LOCK:
-        if CURRENT is not None and CURRENT.status in ACTIVE_STATES:
+        # Reject while the previous child is alive or not yet reaped.
+        if CURRENT is not None and not CURRENT.reaped:
             return jsonify({"error": "已有未结束的运行，请先终止或等待其结束"}), 409
         run = Run(code)
         CURRENT = run
 
-    proc = subprocess.Popen(
-        [sys.executable, "-u", TRACER_PATH],
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
-        text=True,
-        bufsize=1,
-    )
-    run.proc = proc
-    threading.Thread(target=reader_thread, args=(run,), daemon=True).start()
+    # Popen is performed WITHOUT LOCK: holding it would deadlock against a
+    # terminate waiting for this spawn to attach the child.
     try:
-        proc.stdin.write(json.dumps({"code": code}) + "\n")
-        proc.stdin.flush()
-    except (BrokenPipeError, OSError):
+        proc = subprocess.Popen(
+            [sys.executable, "-u", TRACER_PATH],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            bufsize=1,
+        )
+    except OSError:
         with LOCK:
             run.status = "exception"
             run.exception = "运行子进程启动失败"
+            run.reaped = True
+        with STARTUP_COND:
+            run.spawn_done = True
+            STARTUP_COND.notify_all()
+        return jsonify({"run_id": run.run_id})
+
+    # Publish the child atomically with the terminate-intent decision, all
+    # under STARTUP_COND: a terminate either arrives before this point (its
+    # terminate_requested flag is observed here and the spawn thread kills +
+    # reaps the child) or after it (it is guaranteed to see run.proc and does
+    # the kill itself). There is no in-between where terminate sees neither
+    # a pending flag nor an attached proc.
+    with STARTUP_COND:
+        abort = run.terminate_requested
+        run.spawn_done = True
+        with LOCK:
+            run.proc = proc
+            if abort:
+                run.status = "terminated"
+        STARTUP_COND.notify_all()
+
+    if abort:
+        # Terminate arrived during spawn: no reader was started, so reap the
+        # just-created child here (kill, drain EOF, close pipes) and publish
+        # reaped; the waiting /api/terminate then returns success.
+        try:
+            proc.kill()
+        except OSError:
+            pass
+        try:
+            proc.communicate(timeout=5)
+        except (subprocess.TimeoutExpired, OSError):
+            try:
+                proc.wait(timeout=5)
+            except (subprocess.TimeoutExpired, OSError):
+                pass
+        with LOCK:
+            run.reaped = True
+        with STARTUP_COND:
+            STARTUP_COND.notify_all()
+        return jsonify({"run_id": run.run_id})
+
+    with LOCK:
+        threading.Thread(target=reader_thread, args=(run,), daemon=True).start()
+        write_failed = False
+        try:
+            proc.stdin.write(json.dumps({"code": code}) + "\n")
+            proc.stdin.flush()
+        except (BrokenPipeError, OSError):
+            # Child died immediately; the reader drains EOF and reaps.
+            write_failed = True
+        if write_failed:
+            if run.status in ACTIVE_STATES:
+                run.status = "exception"
+            run.exception = "运行子进程启动失败"
+        elif run.status == "starting":
+            run.status = "running"
     return jsonify({"run_id": run.run_id})
 
 
@@ -185,24 +315,35 @@ def api_continue():
 def api_terminate():
     data = request.get_json(force=True, silent=True) or {}
     run_id = data.get("run_id")
-    proc = None
+
     with LOCK:
         run = CURRENT
         if run is None or run.run_id != run_id:
             return jsonify({"error": "运行不存在或已过期"}), 409
         if run.status in ACTIVE_STATES:
             run.status = "terminated"
+        proc = run.proc
+
+    if proc is None:
+        # Child not attached yet (startup window). Record the intent and wait
+        # for the spawn to finish; /api/run hands the child over and kills it
+        # (or, on spawn failure, the run is already reaped).
+        with STARTUP_COND:
+            run.terminate_requested = True
+            STARTUP_COND.wait_for(
+                lambda: run.spawn_done or run.reaped, timeout=10
+            )
+        with LOCK:
             proc = run.proc
-    if proc is not None:
-        try:
-            proc.kill()
-        except OSError:
-            pass
-        try:
-            proc.wait(timeout=5)  # reap the child
-        except subprocess.TimeoutExpired:
-            pass
-    return jsonify({"ok": True, "status": run.status})
+        if proc is not None:
+            _kill_and_wait_for_reap(run, proc)
+        # Spawn failure path: run is reaped already.
+    else:
+        if not run.reaped:
+            _kill_and_wait_for_reap(run, proc)
+
+    with LOCK:
+        return jsonify({"ok": True, "status": run.status})
 
 
 @app.get("/api/state")
